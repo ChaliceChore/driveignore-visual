@@ -78,6 +78,12 @@ var googleStubExts = map[string]bool{
 	".gshortcut": true,
 }
 
+// isConflictCopy matches the copies this tool (and Syncthing-style tools)
+// leave behind. They are preserved on both sides but never re-synced.
+func isConflictCopy(name string) bool {
+	return strings.Contains(name, ".sync-conflict-")
+}
+
 func isGoogleStub(name string) bool {
 	return googleStubExts[strings.ToLower(filepath.Ext(name))]
 }
@@ -129,14 +135,15 @@ func Reconcile(cfg Config, statePath string, opts WatchOptions) (Report, error) 
 	if opts.DryRun {
 		return report, nil
 	}
-	unsettled, deleted, err := run.apply(report)
-	if err != nil {
-		return report, err
-	}
+	// A failed action must not block the journal: committing the actions that
+	// did land keeps the next pass from misreading them (a stale journal turns
+	// every later edit into a bogus conflict). Failed paths stay unsettled and
+	// retry next pass; their errors are still reported.
+	unsettled, deleted, applyErr := run.apply(report)
 	if err := run.commit(statePath, unsettled, deleted); err != nil {
-		return report, err
+		return report, errors.Join(applyErr, err)
 	}
-	return report, nil
+	return report, applyErr
 }
 
 // watchRun carries one pass's observations. local and out are keyed by the
@@ -170,6 +177,10 @@ func (r *watchRun) scan(root string, seen map[string]*sideEntry, matcher Matcher
 		if entry.Type()&fs.ModeSymlink != 0 {
 			r.cfg.tick(rel)
 			r.cfg.logf("skipped symlink: %s", filepath.ToSlash(rel))
+			return nil
+		}
+		if !entry.IsDir() && isConflictCopy(entry.Name()) {
+			r.cfg.tick(rel)
 			return nil
 		}
 		if isGoogleStub(entry.Name()) {
@@ -289,6 +300,14 @@ func (r *watchRun) classify(rel string) (Action, bool) {
 		if r.fresh(local.info) || r.fresh(out.info) {
 			return Action{ActionDeferred, path, ""}, true
 		}
+		// Two different files with identical bytes (a sync client rewrote one
+		// side, or the journal is stale) are not a conflict: just relink.
+		if local.info.Size() == out.info.Size() {
+			same, err := sameContent(filepath.Join(r.cfg.Input, rel), filepath.Join(r.cfg.Output, rel))
+			if err == nil && same {
+				return Action{ActionRelinked, path, conflictDetail(local.info, out.info)}, true
+			}
+		}
 		return Action{ActionConflict, path, conflictDetail(local.info, out.info)}, true
 
 	case localOK && !outOK:
@@ -407,50 +426,57 @@ func (r *watchRun) fresh(info os.FileInfo) bool {
 func (r *watchRun) apply(report Report) (unsettled, deleted map[string]bool, err error) {
 	unsettled = map[string]bool{}
 	deleted = map[string]bool{}
+	var errs []error
 	for _, action := range report.Actions {
-		switch action.Kind {
-		case ActionCreatedDir:
-			rel := filepath.FromSlash(action.Path)
-			goal := filepath.Join(r.cfg.Input, rel)
-			if _, local := r.local[rel]; local {
-				goal = filepath.Join(r.cfg.Output, rel)
-			}
-			if err := r.cfg.mkdirAll(goal, 0o755); err != nil {
-				return nil, nil, fmt.Errorf("create directory %s: %w", action.Path, err)
-			}
-			r.cfg.logf("created directory: %s", action.Path)
-		case ActionLinked, ActionImported, ActionRelinked:
-			source, goal := r.installTargets(action)
-			if err := r.cfg.mkdirAll(filepath.Dir(goal), 0o755); err != nil {
-				return nil, nil, fmt.Errorf("create parent of %s: %w", action.Path, err)
-			}
-			if err := installLink(r.cfg, source, goal, action.Path); err != nil {
-				return nil, nil, err
-			}
-		case ActionTrashedLocal:
-			if err := r.trash(action.Path); err != nil {
-				return nil, nil, err
-			}
-			deleted[filepath.FromSlash(action.Path)] = true
-		case ActionRemovedDrive:
-			rel := filepath.FromSlash(action.Path)
-			if err := r.cfg.remove(filepath.Join(r.cfg.Output, rel)); err != nil {
-				return nil, nil, fmt.Errorf("remove %s: %w", action.Path, err)
-			}
-			deleted[rel] = true
-			r.cfg.logf("removed: %s", action.Path)
-		case ActionConflict:
-			if err := r.resolveConflict(action); err != nil {
-				return nil, nil, err
-			}
-		default:
-			// Report-only kinds (deferred, type-conflict) run again next
-			// pass; their paths and ancestors must stay unpruned.
-			r.cfg.logf("left for a later pass: %s: %s", action.Kind, action.Path)
+		if actionErr := r.applyOne(action, unsettled, deleted); actionErr != nil {
+			errs = append(errs, actionErr)
+			r.cfg.logf("failed, will retry next pass: %s: %s", action.Kind, action.Path)
 			markUnsettled(unsettled, action.Path)
 		}
 	}
-	return unsettled, deleted, nil
+	return unsettled, deleted, errors.Join(errs...)
+}
+
+// applyOne executes a single action. Its error never aborts the pass.
+func (r *watchRun) applyOne(action Action, unsettled, deleted map[string]bool) error {
+	switch action.Kind {
+	case ActionCreatedDir:
+		rel := filepath.FromSlash(action.Path)
+		goal := filepath.Join(r.cfg.Input, rel)
+		if _, local := r.local[rel]; local {
+			goal = filepath.Join(r.cfg.Output, rel)
+		}
+		if err := r.cfg.mkdirAll(goal, 0o755); err != nil {
+			return fmt.Errorf("create directory %s: %w", action.Path, err)
+		}
+		r.cfg.logf("created directory: %s", action.Path)
+	case ActionLinked, ActionImported, ActionRelinked:
+		source, goal := r.installTargets(action)
+		if err := r.cfg.mkdirAll(filepath.Dir(goal), 0o755); err != nil {
+			return fmt.Errorf("create parent of %s: %w", action.Path, err)
+		}
+		return installLink(r.cfg, source, goal, action.Path)
+	case ActionTrashedLocal:
+		if err := r.trash(action.Path); err != nil {
+			return err
+		}
+		deleted[filepath.FromSlash(action.Path)] = true
+	case ActionRemovedDrive:
+		rel := filepath.FromSlash(action.Path)
+		if err := r.removeDrive(filepath.Join(r.cfg.Output, rel)); err != nil {
+			return fmt.Errorf("remove %s: %w", action.Path, err)
+		}
+		deleted[rel] = true
+		r.cfg.logf("removed: %s", action.Path)
+	case ActionConflict:
+		return r.resolveConflict(action)
+	default:
+		// Report-only kinds (deferred, type-conflict) run again next
+		// pass; their paths and ancestors must stay unpruned.
+		r.cfg.logf("left for a later pass: %s: %s", action.Kind, action.Path)
+		markUnsettled(unsettled, action.Path)
+	}
+	return nil
 }
 
 // resolveConflict applies one ActionConflict. Detail names the winning side;
@@ -784,4 +810,22 @@ func sortActions(actions []Action) {
 
 func isDeletion(kind ActionKind) bool {
 	return kind == ActionTrashedLocal || kind == ActionRemovedDrive
+}
+
+// removeDrive removes a drive-side path. Windows refuses to delete a read-only
+// directory (Explorer and Drive set the attribute on customized folders), so a
+// permission failure clears the read-only bit and retries once.
+func (r *watchRun) removeDrive(path string) error {
+	err := r.cfg.remove(path)
+	if err == nil || !errors.Is(err, fs.ErrPermission) {
+		return err
+	}
+	info, statErr := os.Lstat(path)
+	if statErr != nil || info.Mode().Perm()&0o200 != 0 {
+		return err
+	}
+	if chErr := os.Chmod(path, info.Mode().Perm()|0o200); chErr != nil {
+		return err
+	}
+	return r.cfg.remove(path)
 }

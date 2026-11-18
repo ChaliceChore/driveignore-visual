@@ -661,11 +661,10 @@ func TestReconcileCreatesEmptyDirsAndHandlesUnicodeDeepPaths(t *testing.T) {
 	})
 }
 
-func TestReconcileAbortsBeforeCommitOnFailure(t *testing.T) {
+func TestReconcileCommitsLandedWorkDespiteFailure(t *testing.T) {
 	src, out, state := syncedPair(t)
 	write(t, filepath.Join(src, "a-first.txt"), "first")
 	write(t, filepath.Join(src, "b-second.txt"), "second")
-	stateBefore := read(t, state)
 
 	boom := errors.New("link boom")
 	cfg := baseConfig(t, src, out)
@@ -680,8 +679,12 @@ func TestReconcileAbortsBeforeCommitOnFailure(t *testing.T) {
 
 	_, err := Reconcile(cfg, state, applyOpts(t))
 	require.ErrorIs(t, err, boom)
-	require.Equal(t, 2, links, "the pass must stop at the failing install")
-	require.Equal(t, stateBefore, read(t, state), "a failed pass must not commit the journal")
+	require.Equal(t, 2, links, "a failing action must not stop the rest of the pass")
+	assertLinked(t, filepath.Join(src, "a-first.txt"), filepath.Join(out, "a-first.txt"))
+	j1, ok := loadJournal(state)
+	require.True(t, ok)
+	require.Equal(t, "file", j1.Entries["a-first.txt"].Type, "landed work must be committed")
+	require.NotContains(t, j1.Entries, "b-second.txt")
 	assertNoTempEntries(t, out)
 
 	// The next clean pass finishes the interrupted work and converges.
@@ -1202,4 +1205,50 @@ func TestReconcileLeavesTypeMismatchAloneAndRepeatsIt(t *testing.T) {
 			require.Equal(t, first.Actions, second.Actions, "a type conflict must repeat until resolved by hand")
 		})
 	}
+}
+
+func TestReconcileIdenticalContentIsNotAConflict(t *testing.T) {
+	src, out, state := syncedPair(t)
+	// Simulate a sync client rewriting the drive copy: new inode, same bytes,
+	// and a stale journal that matches neither side.
+	require.NoError(t, os.Remove(filepath.Join(out, "keep.txt")))
+	write(t, filepath.Join(out, "keep.txt"), "keep")
+	require.NoError(t, os.Remove(filepath.Join(src, "keep.txt")))
+	write(t, filepath.Join(src, "keep.txt"), "keep")
+	old := time.Now().Add(-time.Minute)
+	require.NoError(t, os.Chtimes(filepath.Join(src, "keep.txt"), old, old))
+	require.NoError(t, os.Chtimes(filepath.Join(out, "keep.txt"), old, old))
+
+	report, err := Reconcile(baseConfig(t, src, out), state, applyOpts(t))
+	require.NoError(t, err)
+	for _, a := range report.Actions {
+		require.NotEqual(t, ActionConflict, a.Kind)
+	}
+	assertLinked(t, filepath.Join(src, "keep.txt"), filepath.Join(out, "keep.txt"))
+	matches, _ := filepath.Glob(filepath.Join(src, "*sync-conflict*"))
+	require.Empty(t, matches)
+}
+
+func TestReconcileIgnoresConflictCopies(t *testing.T) {
+	src, out, state := syncedPair(t)
+	write(t, filepath.Join(src, "keep.txt.sync-conflict-drive-20200102T030405"), "old")
+	old := time.Now().Add(-time.Minute)
+	require.NoError(t, os.Chtimes(filepath.Join(src, "keep.txt.sync-conflict-drive-20200102T030405"), old, old))
+	report, err := Reconcile(baseConfig(t, src, out), state, applyOpts(t))
+	require.NoError(t, err)
+	require.Empty(t, report.Actions)
+	require.NoFileExists(t, filepath.Join(out, "keep.txt.sync-conflict-drive-20200102T030405"))
+}
+
+func TestReconcileRemovesReadOnlyDriveDirectory(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("read-only directories only block removal on Windows")
+	}
+	src, out, state := syncedPair(t)
+	require.NoError(t, os.Remove(filepath.Join(src, "empty")) )
+	require.NoError(t, os.Chmod(filepath.Join(out, "empty"), 0o555))
+	report, err := Reconcile(baseConfig(t, src, out), state, applyOpts(t))
+	require.NoError(t, err)
+	require.Equal(t, []Action{{ActionRemovedDrive, "empty", ""}}, report.Actions)
+	require.NoDirExists(t, filepath.Join(out, "empty"))
 }
