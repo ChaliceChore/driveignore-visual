@@ -84,7 +84,7 @@ func LoadIgnore(root string, merge bool, globalPath func() (string, error)) (Mat
 		patterns = append(patterns, localPatterns...)
 	}
 
-	nested, nestedFound, err := nestedPatterns(root)
+	nested, nestedFound, err := nestedPatterns(root, patterns)
 	if err != nil {
 		return nil, "", err
 	}
@@ -111,29 +111,54 @@ func readPatterns(path string, domain []string) ([]gitignore.Pattern, bool, erro
 // nestedPatterns collects .driveignore files below root, in walk order so
 // parents come before children and deeper files win. The root file is skipped
 // because LoadIgnore handles it. found reports whether any nested file exists.
-func nestedPatterns(root string) (patterns []gitignore.Pattern, found bool, err error) {
+//
+// Like git, it never descends into a directory the rules gathered so far
+// (base plus every shallower nested file) exclude: nothing below it is synced,
+// so its .driveignore files cannot matter, and walking .git, node_modules or a
+// venv on every pass is the bulk of a pass's cost. A directory's own file is
+// read on entering it, before its children are judged. A directory that
+// vanishes or cannot be read mid-walk is skipped instead of failing the load:
+// the sync walk cannot read it either.
+func nestedPatterns(root string, base []gitignore.Pattern) (patterns []gitignore.Pattern, found bool, err error) {
+	// all is base followed by the nested patterns, in precedence order, so the
+	// last matching rule wins exactly as it does in the final matcher.
+	all := append([]gitignore.Pattern(nil), base...)
 	err = filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {
+			if path == root {
+				return err
+			}
+			if errors.Is(err, fs.ErrNotExist) || errors.Is(err, fs.ErrPermission) {
+				if entry != nil && entry.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
+			}
 			return err
 		}
-		if entry.IsDir() || entry.Name() != ".driveignore" {
+		if !entry.IsDir() || path == root {
 			return nil
 		}
-		dir := filepath.Dir(path)
-		if dir == root {
-			return nil
-		}
-		rel, err := filepath.Rel(root, dir)
+		rel, err := filepath.Rel(root, path)
 		if err != nil {
 			return err
 		}
-		domain := strings.Split(filepath.ToSlash(rel), "/")
-		content, err := os.ReadFile(path)
+		parts := strings.Split(filepath.ToSlash(rel), "/")
+		if matchPatterns(all, parts, true) {
+			return filepath.SkipDir
+		}
+		filePatterns, exists, err := readPatterns(filepath.Join(path, ".driveignore"), parts)
 		if err != nil {
+			if errors.Is(err, fs.ErrPermission) {
+				return filepath.SkipDir
+			}
 			return err
 		}
-		patterns = append(patterns, parsePatterns(content, domain)...)
-		found = true
+		if exists {
+			patterns = append(patterns, filePatterns...)
+			all = append(all, filePatterns...)
+			found = true
+		}
 		return nil
 	})
 	return patterns, found, err

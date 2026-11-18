@@ -22,6 +22,7 @@ func newWatchCmd() *cobra.Command {
 		uninstall bool
 		interval  time.Duration
 		trashDir  string
+		allowMass bool
 	)
 	cmd := &cobra.Command{
 		Use:   "watch [drive folder]",
@@ -65,7 +66,7 @@ print what a pass would do without changing anything.`,
 			if err := requireHardlinks(input, args[0]); err != nil {
 				return err
 			}
-			opts := driveignore.WatchOptions{DryRun: dryRun, OneWay: oneWay, TrashDir: trashDir}
+			opts := driveignore.WatchOptions{DryRun: dryRun, OneWay: oneWay, TrashDir: trashDir, AllowMassDelete: allowMass}
 			if once {
 				_, err := runWatchPass(cfg, statePath, opts, cmd.OutOrStdout(), verbose)
 				return err
@@ -81,6 +82,7 @@ print what a pass would do without changing anything.`,
 	cmd.Flags().BoolVar(&uninstall, "uninstall", false, "Uninstall the pair's launchd agent (macOS only)")
 	cmd.Flags().DurationVar(&interval, "interval", pollBaseInterval, "Base time between passes while changes flow (idle backs off to 60s)")
 	cmd.Flags().StringVar(&trashDir, "trash-dir", "", "Directory local deletions move to (default: ~/.Trash)")
+	cmd.Flags().BoolVar(&allowMass, "allow-mass-delete", false, "Apply deletions the mass-deletion guard holds (an emptied side, or more than 50 and 20% of tracked files at once)")
 	return cmd
 }
 
@@ -88,7 +90,7 @@ print what a pass would do without changing anything.`,
 // watch's safety model assumes one filesystem, so a pair that cannot link
 // fails here instead of silently degrading to copies.
 func requireHardlinks(input, output string) error {
-	probe, err := os.CreateTemp(input, ".driveignore-watch-probe-*")
+	probe, err := os.CreateTemp(input, ".driveignore-tmp-probe-*")
 	if err != nil {
 		return fmt.Errorf("watch cannot create a probe in %s: %w", input, err)
 	}
@@ -129,7 +131,7 @@ func watchLoop(cmd *cobra.Command, cfg driveignore.Config, statePath string, opt
 		if err != nil {
 			_, _ = fmt.Fprintln(errOut, "watch:", err)
 		}
-		interval = nextPollInterval(interval, base, len(report.Actions) > 0, err != nil)
+		interval = nextPollInterval(interval, base, madeProgress(report), err != nil)
 		time.Sleep(interval)
 	}
 }
@@ -139,10 +141,18 @@ func watchLoop(cmd *cobra.Command, cfg driveignore.Config, statePath string, opt
 // deferrals and type mismatches unless verbose, and summarizes itself only
 // when it had work.
 func printWatchReport(out io.Writer, report driveignore.Report, dryRun, verbose bool, elapsed time.Duration) {
-	deferred := 0
+	deferred, held := 0, 0
 	for _, action := range report.Actions {
 		if action.Kind == driveignore.ActionDeferred {
 			deferred++
+		}
+		if action.Kind == driveignore.ActionHeld {
+			held++
+			// Held deletions repeat every pass; a quiet pass summarizes them
+			// in one line instead of listing every path each time.
+			if !dryRun && !verbose {
+				continue
+			}
 		}
 		if !dryRun && !verbose && !watchAlwaysReports(action.Kind) {
 			continue
@@ -156,6 +166,13 @@ func printWatchReport(out io.Writer, report driveignore.Report, dryRun, verbose 
 		}
 		_, _ = fmt.Fprintln(out, line)
 	}
+	if held > 0 {
+		prefix := ""
+		if dryRun {
+			prefix = "would "
+		}
+		_, _ = fmt.Fprintf(out, "%shold %d deletion(s): mass-deletion guard; check both folders, then run once with --allow-mass-delete to apply them\n", prefix, held)
+	}
 	if dryRun {
 		_, _ = fmt.Fprintf(out, "would apply %d action(s)\n", len(report.Actions))
 		return
@@ -163,6 +180,17 @@ func printWatchReport(out io.Writer, report driveignore.Report, dryRun, verbose 
 	if len(report.Actions) > 0 {
 		_, _ = fmt.Fprintf(out, "pass: %d action(s), %d deferred in %s\n", len(report.Actions), deferred, elapsed.Round(10*time.Millisecond))
 	}
+}
+
+// madeProgress reports whether a pass did or may soon do work. Held deletions
+// wait for a human, so a pass holding only those idles like an empty one.
+func madeProgress(report driveignore.Report) bool {
+	for _, action := range report.Actions {
+		if action.Kind != driveignore.ActionHeld {
+			return true
+		}
+	}
+	return false
 }
 
 // watchAlwaysReports decides which kinds a real non-verbose pass prints:
@@ -174,7 +202,9 @@ func watchAlwaysReports(kind driveignore.ActionKind) bool {
 		driveignore.ActionRemovedDrive,
 		driveignore.ActionConflict,
 		driveignore.ActionTypeConflict,
-		driveignore.ActionDeferred:
+		driveignore.ActionDeferred,
+		driveignore.ActionHeld,
+		driveignore.ActionRenamedCase:
 		return true
 	default:
 		return false

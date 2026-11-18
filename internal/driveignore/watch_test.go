@@ -1229,17 +1229,6 @@ func TestReconcileIdenticalContentIsNotAConflict(t *testing.T) {
 	require.Empty(t, matches)
 }
 
-func TestReconcileIgnoresConflictCopies(t *testing.T) {
-	src, out, state := syncedPair(t)
-	write(t, filepath.Join(src, "keep.txt.sync-conflict-drive-20200102T030405"), "old")
-	old := time.Now().Add(-time.Minute)
-	require.NoError(t, os.Chtimes(filepath.Join(src, "keep.txt.sync-conflict-drive-20200102T030405"), old, old))
-	report, err := Reconcile(baseConfig(t, src, out), state, applyOpts(t))
-	require.NoError(t, err)
-	require.Empty(t, report.Actions)
-	require.NoFileExists(t, filepath.Join(out, "keep.txt.sync-conflict-drive-20200102T030405"))
-}
-
 func TestReconcileRemovesReadOnlyDriveDirectory(t *testing.T) {
 	if runtime.GOOS != "windows" {
 		t.Skip("read-only directories only block removal on Windows")

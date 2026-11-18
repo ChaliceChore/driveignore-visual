@@ -113,6 +113,11 @@ Every command documents its flags in `--help`. The shared flags are:
 - `--trash-dir` (`watch`): directory local deletions move to (default
   `~/.Trash`; set it where that directory does not exist, for example on Linux
   or Windows)
+- `--allow-mass-delete` (`watch`): apply deletions the mass-deletion guard
+  holds. A pass holds every deletion when one side has no files left, or when
+  it would delete more than 50 paths and more than 20% of the tracked files;
+  held deletions are reported every pass until you check both folders and run
+  once with this flag
 - `--install`, `--uninstall` (`watch`, `guard`, macOS only): install or remove
   the launchd agent that keeps the pair reconciled, or the folder sealed, from
   login

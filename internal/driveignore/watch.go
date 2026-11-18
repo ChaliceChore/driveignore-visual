@@ -7,6 +7,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -25,6 +26,9 @@ type WatchOptions struct {
 	OneWay   bool
 	MinAge   time.Duration
 	TrashDir string
+	// AllowMassDelete lets a pass apply deletions the mass-deletion guard
+	// would otherwise hold (an emptied side, or too many at once).
+	AllowMassDelete bool
 }
 
 // ActionKind names what a pass decided for one path. The string is the stable
@@ -41,7 +45,59 @@ const (
 	ActionConflict     ActionKind = "conflict"
 	ActionDeferred     ActionKind = "deferred"
 	ActionTypeConflict ActionKind = "type-conflict"
+	// ActionHeld is a deletion the mass-deletion guard refused to apply;
+	// Detail names the deletion kind it stands for.
+	ActionHeld ActionKind = "held-deletion"
+	// ActionRenamedCase is a case-only rename taken over from the other side
+	// on a case-insensitive filesystem; Detail names the side renamed.
+	ActionRenamedCase ActionKind = "renamed-case"
 )
+
+// Mass-deletion guard: a pass holds every deletion when one side has no files
+// left while the journal still records some, or when it would delete more
+// than massDeleteMin paths and more than massDeleteRatio of the journal.
+const (
+	massDeleteMin   = 50
+	massDeleteRatio = 0.2
+)
+
+// caseInsensitiveFS reports whether path names differing only in case name
+// the same entry, as on default Windows and macOS volumes.
+var caseInsensitiveFS = runtime.GOOS == "windows" || runtime.GOOS == "darwin"
+
+// tempPrefix starts the name of every temporary entry this tool creates in a
+// synced tree. Such entries are never synced, and stale ones are removed.
+const tempPrefix = ".driveignore-tmp-"
+
+// staleTempAge is how old a leftover temporary entry must be before a pass
+// removes it: far beyond any install, so a live one is never touched.
+const staleTempAge = time.Hour
+
+// isTempName matches this tool's temporary entries, including the names
+// older versions used (.driveignore-<digits>, .driveignore-watch-probe-*).
+func isTempName(name string) bool {
+	if strings.HasPrefix(name, tempPrefix) || strings.HasPrefix(name, ".driveignore-watch-probe-") {
+		return true
+	}
+	rest, ok := strings.CutPrefix(name, ".driveignore-")
+	if !ok || rest == "" {
+		return false
+	}
+	for _, c := range rest {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// isSpecial reports an entry that is neither a directory nor a regular file
+// nor a symlink: a Windows junction or other reparse point, a device, a pipe
+// or a socket. None of them can be hardlinked, so they are skipped.
+func isSpecial(entry fs.DirEntry) bool {
+	t := entry.Type()
+	return !entry.IsDir() && t&fs.ModeSymlink == 0 && !t.IsRegular()
+}
 
 // Detail values carried by relink and conflict actions to name the winning
 // side. They appear in dry-run output, so keep the strings stable.
@@ -76,12 +132,6 @@ var googleStubExts = map[string]bool{
 	".gslides":   true,
 	".gdraw":     true,
 	".gshortcut": true,
-}
-
-// isConflictCopy matches the copies this tool (and Syncthing-style tools)
-// leave behind. They are preserved on both sides but never re-synced.
-func isConflictCopy(name string) bool {
-	return strings.Contains(name, ".sync-conflict-")
 }
 
 func isGoogleStub(name string) bool {
@@ -131,7 +181,9 @@ func Reconcile(cfg Config, statePath string, opts WatchOptions) (Report, error) 
 	if err := run.scan(cfg.Output, run.out, matcher); err != nil {
 		return Report{}, err
 	}
-	report := Report{Actions: run.actions()}
+	caseActions, caseErr := run.reconcileCase()
+	actions := run.guardDeletions(run.actions())
+	report := Report{Actions: append(caseActions, actions...)}
 	if opts.DryRun {
 		return report, nil
 	}
@@ -139,7 +191,8 @@ func Reconcile(cfg Config, statePath string, opts WatchOptions) (Report, error) 
 	// did land keeps the next pass from misreading them (a stale journal turns
 	// every later edit into a bogus conflict). Failed paths stay unsettled and
 	// retry next pass; their errors are still reported.
-	unsettled, deleted, applyErr := run.apply(report)
+	unsettled, deleted, applyErr := run.apply(Report{Actions: actions})
+	applyErr = errors.Join(caseErr, applyErr)
 	if err := run.commit(statePath, unsettled, deleted); err != nil {
 		return report, errors.Join(applyErr, err)
 	}
@@ -158,6 +211,9 @@ type watchRun struct {
 	local   map[string]*sideEntry
 	out     map[string]*sideEntry
 	pruned  map[string]bool
+	// caseSkip holds folded paths whose case-only rename failed this pass;
+	// they and everything below them wait for the next pass.
+	caseSkip map[string]bool
 }
 
 // sideEntry is one path seen during a walk. Files carry the stat data the
@@ -179,8 +235,14 @@ func (r *watchRun) scan(root string, seen map[string]*sideEntry, matcher Matcher
 			r.cfg.logf("skipped symlink: %s", filepath.ToSlash(rel))
 			return nil
 		}
-		if !entry.IsDir() && isConflictCopy(entry.Name()) {
+		if isSpecial(entry) {
 			r.cfg.tick(rel)
+			r.cfg.logf("skipped special entry: %s", filepath.ToSlash(rel))
+			return nil
+		}
+		if !entry.IsDir() && isTempName(entry.Name()) {
+			r.cfg.tick(rel)
+			r.removeStaleTemp(path, entry, rel)
 			return nil
 		}
 		if isGoogleStub(entry.Name()) {
@@ -267,7 +329,7 @@ func (r *watchRun) classify(rel string) (Action, bool) {
 	// subtree, so the ancestor's report-only conflict is the only decision
 	// until a human resolves it. Acting on a descendant would install through
 	// a path that is a file on the other side and fail the whole pass.
-	if r.belowTypeConflict(rel) {
+	if r.belowTypeConflict(rel) || r.underCaseSkip(rel) {
 		return Action{}, false
 	}
 	local, localOK := r.local[rel]
@@ -414,8 +476,16 @@ func (r *watchRun) importFile(path string, source os.FileInfo) Action {
 
 // fresh reports whether the file was modified within the churn window, so a
 // pass must not copy it yet: it may still be mid-write.
+// A future modification time (a skewed clock on the machine that wrote the
+// file) is not evidence of a write in progress, so it does not defer: such a
+// file would otherwise wait until the clock caught up.
 func (r *watchRun) fresh(info os.FileInfo) bool {
-	return time.Since(info.ModTime()) < r.minAge
+	age := time.Since(info.ModTime())
+	if age < 0 {
+		r.cfg.logf("future modification time, not deferring: %s", info.Name())
+		return false
+	}
+	return age < r.minAge
 }
 
 // apply executes the report and returns the paths whose action it left for a
@@ -497,17 +567,23 @@ func (r *watchRun) resolveConflict(action Action) error {
 	if err != nil {
 		return fmt.Errorf("conflict %s: %w", action.Path, err)
 	}
-	copyRel, err := r.conflictCopyPath(action.Path, loserInfo, loserSide)
+	copyRel, reused, err := r.conflictCopyPath(action.Path, loserInfo, loserSide, loserRoot)
 	if err != nil {
 		return err
 	}
 	loserCopy := filepath.Join(loserRoot, filepath.FromSlash(copyRel))
 	otherCopy := filepath.Join(otherRoot, filepath.FromSlash(copyRel))
-	if err := installLink(r.cfg, loserPath, loserCopy, copyRel); err != nil {
-		return err
+	// A copy left by an earlier pass whose final install failed already
+	// preserves the loser: reuse it instead of making one more each retry.
+	if !reused {
+		if err := installLink(r.cfg, loserPath, loserCopy, copyRel); err != nil {
+			return err
+		}
 	}
-	if err := installLink(r.cfg, loserCopy, otherCopy, copyRel); err != nil {
-		return err
+	if otherInfo, err := r.cfg.lstat(otherCopy); err != nil || !os.SameFile(otherInfo, loserInfo) {
+		if err := installLink(r.cfg, loserCopy, otherCopy, copyRel); err != nil {
+			return err
+		}
 	}
 	if err := installLink(r.cfg, winnerPath, loserPath, action.Path); err != nil {
 		return err
@@ -520,19 +596,24 @@ func (r *watchRun) resolveConflict(action Action) error {
 // full file name plus .sync-conflict-<side>-<loser mtime in UTC>, with -1,
 // -2, ... appended after the timestamp while the name is taken on either
 // side. The losing file's mtime keeps names deterministic (no clock read).
-func (r *watchRun) conflictCopyPath(rel string, loser os.FileInfo, side string) (string, error) {
+// A taken name whose entry on the loser's side already is the losing file is
+// returned with reused set, so a retried conflict never adds another copy.
+func (r *watchRun) conflictCopyPath(rel string, loser os.FileInfo, side, loserRoot string) (string, bool, error) {
 	base := rel + ".sync-conflict-" + side + "-" + loser.ModTime().UTC().Format("20060102T150405")
 	for i := 0; ; i++ {
 		name := base
 		if i > 0 {
 			name = fmt.Sprintf("%s-%d", base, i)
 		}
+		if info, err := r.cfg.lstat(filepath.Join(loserRoot, filepath.FromSlash(name))); err == nil && os.SameFile(info, loser) {
+			return name, true, nil
+		}
 		free, err := r.conflictNameFree(name)
 		if err != nil {
-			return "", err
+			return "", false, err
 		}
 		if free {
-			return name, nil
+			return name, false, nil
 		}
 	}
 }
@@ -627,7 +708,7 @@ func (r *watchRun) installTargets(action Action) (source, goal string) {
 // sibling and a rename, so goalPath is never missing while the new entry is
 // prepared. It is the upload install recipe, usable in either direction.
 func installLink(cfg Config, sourcePath, goalPath, rel string) error {
-	tmp, err := os.CreateTemp(filepath.Dir(goalPath), ".driveignore-*")
+	tmp, err := os.CreateTemp(filepath.Dir(goalPath), tempPrefix+"*")
 	if err != nil {
 		return fmt.Errorf("install %s: %w", rel, err)
 	}

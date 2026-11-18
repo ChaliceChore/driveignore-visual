@@ -211,6 +211,10 @@ func Upload(c Config, opts UploadOptions) (UploadResult, error) {
 			u.logf("skipped symlink: %s", filepath.ToSlash(rel))
 			return nil
 		}
+		if isSpecial(entry) || (!entry.IsDir() && isTempName(entry.Name())) {
+			u.logf("skipped special or temporary entry: %s", filepath.ToSlash(rel))
+			return nil
+		}
 		if excluded, dir := skip(matcher, path, entry); excluded {
 			if dir {
 				u.logf("skipped directory: %s", filepath.ToSlash(rel))
@@ -334,7 +338,7 @@ func (u *uploader) inSync(sourcePath, goalPath string, sourceInfo, goalInfo os.F
 // in copy mode. It always works through a temporary sibling and a rename, so
 // an existing drive file is never missing while the new one is prepared.
 func (u *uploader) installFile(sourcePath, goalPath, rel string) error {
-	tmp, err := os.CreateTemp(filepath.Dir(goalPath), ".driveignore-*")
+	tmp, err := os.CreateTemp(filepath.Dir(goalPath), tempPrefix+"*")
 	if err != nil {
 		return fmt.Errorf("install %s: %w", rel, err)
 	}
@@ -491,7 +495,7 @@ func Clean(c Config, opts CleanOptions) ([]string, error) {
 // instead of being treated as a missing file, so a transient error can never
 // delete data.
 func (c Config) removeEntry(path string, entry fs.DirEntry, rel string, ignored Matcher, dryRun bool) (bool, error) {
-	if entry.Type()&fs.ModeSymlink != 0 || entry.IsDir() {
+	if entry.Type()&fs.ModeSymlink != 0 || entry.IsDir() || isSpecial(entry) {
 		return false, nil
 	}
 	sourcePath := filepath.Join(c.Input, rel)
@@ -565,7 +569,7 @@ func Diff(c Config) (DiffResult, error) {
 	var res DiffResult
 	err = Walk(c.Input, func(path string, entry fs.DirEntry, rel string) error {
 		c.tick(rel)
-		if entry.Type()&fs.ModeSymlink != 0 {
+		if entry.Type()&fs.ModeSymlink != 0 || isSpecial(entry) || (!entry.IsDir() && isTempName(entry.Name())) {
 			return nil
 		}
 		if excluded, dir := skip(matcher, path, entry); excluded {
@@ -588,7 +592,7 @@ func Diff(c Config) (DiffResult, error) {
 	}
 	err = Walk(c.Output, func(path string, entry fs.DirEntry, rel string) error {
 		c.tick(rel)
-		if entry.Type()&fs.ModeSymlink != 0 {
+		if entry.Type()&fs.ModeSymlink != 0 || isSpecial(entry) || (!entry.IsDir() && isTempName(entry.Name())) {
 			return nil
 		}
 		same, err := sameEntry(c, path, entry, filepath.Join(c.Input, rel))
